@@ -658,13 +658,24 @@ def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None, skip_info=False,
             if skip_info:
                 if 'code' in entry and entry['code'] == 'info':
                     continue
+                if b'code' in entry and entry[b'code'] == b'info':
+                    continue
             if cb is not None:
                 cb(entry)
             else:
-                result.append(entry)
+                work = {}
+                for key, value in entry.items():
+                    if type(key) == bytes:
+                        key = key.decode()
+                    if type(value) == bytes:
+                        value = value.decode()
+                    work[key] = value
+
+                result.append(work)
     except EOFError:
         pass
     exitCode = p4.wait()
+    
     if exitCode != 0:
         if errors_as_exceptions:
             if len(result) > 0:
@@ -3884,7 +3895,10 @@ class P4Clone(P4Sync):
         depotDir = re.sub("(#[^#]*)$", "", depotDir)
         depotDir = re.sub(r"\.\.\.$", "", depotDir)
         depotDir = re.sub(r"/$", "", depotDir)
-        return os.path.split(depotDir)[1]
+        if (platform.system() == "Windows"):
+            return depotDir.split('/')[-1]
+        else:
+            return os.path.split(depotDir)[1]
 
     def run(self, args):
         if len(args) < 1:
