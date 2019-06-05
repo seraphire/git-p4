@@ -1842,7 +1842,7 @@ class P4Submit(Command, P4UserMap):
     def applyCommit(self, id):
         """Apply one commit, return True if it succeeded."""
 
-        print("Applying", read_pipe(["git", "show", "-s",
+        print("Applying %s" % read_pipe(["git", "show", "-s",
                                      "--format=format:%h %s", id]))
 
         (p4User, gitEmail) = self.p4UserForCommit(id)
@@ -1926,12 +1926,28 @@ class P4Submit(Command, P4UserMap):
             else:
                 die("unknown modifier %s for %s" % (modifier, path))
 
-        diffcmd = "git diff-tree --full-index -p \"%s\"" % (id)
+        # Set the default directory for the command.  This is the original 
+        # path.  For windows, we will want to convert the \ to / so we 
+        # do not need to escape each \.
+        # see: https://stackoverflow.com/questions/1386291/git-git-dir-not-working-as-expected
+        gitDir = self.gitdir
+        workTree = self.clientPath # this is unicode but may cause the windows to hang, we will convert to utf-8 if needed
+
+        if self.isWindows:
+            gitDir = gitDir.replace("\\", "/")
+            workTree =  workTree.encode("utf-8").replace("\\", "/")
+            
+
+        diffcmd = "git --git-dir=\"{0}\" --work-tree=\"{1}\" diff-tree --full-index -p \"{2}\"".format(gitDir, workTree, id)
         patchcmd = diffcmd + " | git apply "
         tryPatchCmd = patchcmd + "--check -"
         applyPatchCmd = patchcmd + "--check --apply -"
         patch_succeeded = True
 
+        if verbose:
+            print("Directory: %s" % os.environ['PWD'])
+            print(tryPatchCmd)
+        
         if os.system(tryPatchCmd) != 0:
             fixed_rcs_keywords = False
             patch_succeeded = False
@@ -1975,6 +1991,10 @@ class P4Submit(Command, P4UserMap):
         if not patch_succeeded:
             for f in editedFiles:
                 p4_revert(f)
+            # If we are windows and the autocrlf is not true, then this might 
+            # be the problem.  Give them the suggestion.
+            if self.isWindows and not gitConfigBool("core.autocrlf"):
+                print("A patch failed to apply and you do not have core.autocrlf set, was this intentional? This can cause problems.")
             return False
 
         #
@@ -2072,35 +2092,38 @@ class P4Submit(Command, P4UserMap):
         submitted = False
 
         try:
-            if self.edit_template(fileName):
-                # read the edited message and submit
-                tmpFile = open(fileName, "rb")
-                message = tmpFile.read()
-                tmpFile.close()
-                if self.isWindows:
-                    message = message.replace("\r\n", "\n")
-                submitTemplate = message[:message.index(separatorLine)]
+            if not self.runHook("p4-pre-edit-changelist", [fileName]):
+                submitted = False
+            else:
+                if self.edit_template(fileName):
+                    # read the edited message and submit
+                    tmpFile = open(fileName, "rb")
+                    message = tmpFile.read()
+                    tmpFile.close()
+                    if self.isWindows:
+                        message = message.replace("\r\n", "\n")
+                    submitTemplate = message[:message.index(separatorLine)]
 
-                if update_shelve:
-                    p4_write_pipe(['shelve', '-r', '-i'], submitTemplate)
-                elif self.shelve:
-                    p4_write_pipe(['shelve', '-i'], submitTemplate)
-                else:
-                    p4_write_pipe(['submit', '-i'], submitTemplate)
-                    # The rename/copy happened by applying a patch that created a
-                    # new file.  This leaves it writable, which confuses p4.
-                    for f in pureRenameCopy:
-                        p4_sync(f, "-f")
+                    if update_shelve:
+                        p4_write_pipe(['shelve', '-r', '-i'], submitTemplate)
+                    elif self.shelve:
+                        p4_write_pipe(['shelve', '-i'], submitTemplate)
+                    else:
+                        p4_write_pipe(['submit', '-i'], submitTemplate)
+                        # The rename/copy happened by applying a patch that created a
+                        # new file.  This leaves it writable, which confuses p4.
+                        for f in pureRenameCopy:
+                            p4_sync(f, "-f")
 
-                if self.preserveUser:
-                    if p4User:
-                        # Get last changelist number. Cannot easily get it from
-                        # the submit command output as the output is
-                        # unmarshalled.
-                        changelist = self.lastP4Changelist()
-                        self.modifyChangelistUser(changelist, p4User)
+                    if self.preserveUser:
+                        if p4User:
+                            # Get last changelist number. Cannot easily get it from
+                            # the submit command output as the output is
+                            # unmarshalled.
+                            changelist = self.lastP4Changelist()
+                            self.modifyChangelistUser(changelist, p4User)
 
-                submitted = True
+                    submitted = True
 
         finally:
             # skip this patch
@@ -2188,6 +2211,93 @@ class P4Submit(Command, P4UserMap):
 
                 if verbose:
                     print("created p4 label for tag %s" % name)
+
+
+    # joins 2 path fragments together
+    def pathJoin(self, first, last):
+
+        if(first.startswith("'") and first.endswith("'")):
+            first = first.strip("'")
+
+        if(first.startswith("\"") and first.endswith("\"")):
+            first = first.strip("\"")
+
+        if(last.startswith("'") and last.endswith("'")):
+            first = last.strip("'")
+
+        if(last.startswith("\"") and last.endswith("\"")):
+            last = last.strip("\"")
+
+        return os.path.join(first, last)
+
+    # Executes a hook, exiting on failure.
+    # returns TRUE if successful, FALSE if the hook 
+    # returns a non-zero exit code.
+    def runHook(self, hook_name, args = []):
+
+        hooks_path = gitConfig("core.hooksPath")
+        if len(hooks_path) <= 0:
+            hooks_path = self.pathJoin(os.environ.get("GIT_DIR", ".git"), "hooks")
+
+        # First, check the guessed path.
+        hook_file = self.pathJoin(hooks_path, hook_name)
+        if not os.path.isfile(hook_file) or not os.access(hook_file, os.X_OK):
+            # Force back to the .git path we are working in
+            hooks_path = self.pathJoin(os.environ.get("GIT_DIR", ".git"), "hooks")
+            hook_file = self.pathJoin(hooks_path, hook_name)
+            if not os.path.isfile(hook_file) or not os.access(hook_file, os.X_OK):
+                # Still canot run the file, bail now.
+                return True
+
+        if self.verbose:
+            print("hooks_path = %s " % hooks_path)
+            print("hook_file = %s " % hook_file)
+
+        # Check if the script exists and we can run it
+        if os.path.isfile(hook_file) and os.access(hook_file, os.X_OK):
+            # If this is windows, we will want to try running the program
+            # We may need to shell and run it.
+            hook_list = [hook_file]
+            if len(args) != 0:
+
+                hook_list = hook_list + args
+            if not self.isWindows:
+                if subprocess.call(hook_list) != 0:
+                    return False
+            else:
+                try:
+                    subprocess.check_call(hook_list)
+                except CalledProcessError as e:
+                    print(e)
+                    return False
+                except WindowsError as e:
+                    if e.winerror == 193:
+                        # This maybe a unix-style script that could be run
+                        # under shell.  Check if we have a shebang
+                        first_line = ""
+                        with open(hook_file) as f:
+                            first_line = f.readline().strip()
+
+                        # If the line does not start with the #!, then we failed for some other 
+                        # reason, reprot and bail
+                        if not first_line.startswith("#!"):
+                            print(e)
+                            return False
+
+                        # Looks like a shell-line
+                        binExe = first_line[2:]
+                        binExe = binExe.replace("\\", "")
+                        binExe = binExe.replace("/", "\\")
+                        hook_list = [binExe] + hook_list
+                        if subprocess.call(hook_list) != 0:
+                            return False
+                    else:
+                        print(e)
+                        return False
+        return True
+
+
+
 
     def run(self, args):
         if len(args) == 0:
@@ -2339,12 +2449,8 @@ class P4Submit(Command, P4UserMap):
             sys.exit("number of commits (%d) must match number of shelved changelist (%d)" %
                      (len(commits), num_shelves))
 
-        hooks_path = gitConfig("core.hooksPath")
-        if len(hooks_path) <= 0:
-            hooks_path = os.path.join(os.environ.get("GIT_DIR", ".git"), "hooks")
-
-        hook_file = os.path.join(hooks_path, "p4-pre-submit")
-        if os.path.isfile(hook_file) and os.access(hook_file, os.X_OK) and subprocess.call([hook_file]) != 0:
+        # Run the p4-pre-submit hook if we have one        
+        if not self.runHook("p4-pre-submit"):
             sys.exit(1)
 
         #
@@ -3053,6 +3159,9 @@ class P4Sync(Command, P4UserMap):
 
         if gitConfigBool('git-p4.keepEmptyCommits'):
             allow_empty = True
+
+        # Use gitConfig to get the core.eol and core.autocrlf core.safecrlf
+        # see: https://adaptivepatchwork.com/2012/03/01/mind-the-end-of-your-line/
 
         if not files and not allow_empty:
             print('Ignoring revision {0} as it would produce an empty commit.'
