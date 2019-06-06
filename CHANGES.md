@@ -1,3 +1,7 @@
+**2019-06-06** 
+  - Updated the p4 submit to catch any exception with reading the file diff into the P4 changelist.  If reading the file fails, the changelist will no longer fail. It will now report that the change text failed to load and that the file may be a binary file.
+  - Added a new setting `git-p4.skipSubmitFileDiff` If this is set, then the File Diff will not be included changelist. (This is removed when the changelist is submitted anyway.)
+
 **2019-06-05** 
 Make the following changes:
   - Changed the default format for the diffcmd in p4 submit method. Added the `--git-dir` and `--work-tree` parameters to the git command. Before this command is executed, the directory is changed, and the git repository cannot be located.

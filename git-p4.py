@@ -1832,10 +1832,15 @@ class P4Submit(Command, P4UserMap):
             if is_link and expect_link:
                 newdiff += "+%s\n" % os.readlink(newFile)
             else:
-                f = open(newFile, "r")
-                for line in f.readlines():
-                    newdiff += "+" + line
-                f.close()
+                try:
+                    fileText = ""
+                    f = open(newFile, "r")
+                    for line in f.readlines():
+                        fileText += "+" + line
+                    f.close()
+                    newdiff += fileText
+                except:
+                    newdiff +="Cannot read the file contents for " + newFile + "; a binary file maybe?"
 
         return (diff + newdiff).replace('\r\n', '\n')
 
@@ -2042,7 +2047,13 @@ class P4Submit(Command, P4UserMap):
         separatorLine = "######## everything below this line is just the diff #######\n"
         if not self.prepare_p4_only:
             submitTemplate += separatorLine
-            submitTemplate += self.get_diff_description(editedFiles, filesToAdd, symlinks)
+            try: 
+                if gitConfigBool("git-p4.skipSubmitFileDiff"):
+                    submitTemplate += "File diff not included because git-p4.skipSubmitFileDiff is set"
+                else:
+                    submitTemplate += self.get_diff_description(editedFiles, filesToAdd, symlinks)
+            except:
+                submitTemplate += "Failed to read diff; This will have no affect on the submitted changelist and can be safely ignored.\n"
 
         (handle, fileName) = tempfile.mkstemp()
         tmpFile = os.fdopen(handle, "w+b")
