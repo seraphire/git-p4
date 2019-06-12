@@ -368,6 +368,9 @@ def p4_integrate(src, dest):
 def p4_sync(f, *options):
     p4_system(["sync"] + list(options) + [wildcard_encode(f)])
 
+def p4_remove(f, *options):
+    p4_system(["sync"] + list(options) + [wildcard_encode(f) + "#0"])
+
 def p4_add(f):
     # forcibly add file names with wildcards
     if wildcard_present(f):
@@ -381,8 +384,13 @@ def p4_delete(f):
 def p4_edit(f, *options):
     p4_system(["edit"] + list(options) + [wildcard_encode(f)])
 
-def p4_revert(f):
-    p4_system(["revert", wildcard_encode(f)])
+def p4_revert(fileSpec, *options):
+    """ revert -- Discard changes from an opened file
+        p4 command: p4 revert [-a -n -k -w -c changelist# -C client] file ...
+        
+        flags can be optionally passed as the second parameter
+        """
+    p4_system(["revert"] + list(options) + [wildcard_encode(fileSpec)])
 
 def p4_reopen(type, f):
     p4_system(["reopen", "-t", type, wildcard_encode(f)])
@@ -1943,10 +1951,13 @@ class P4Submit(Command, P4UserMap):
             workTree =  workTree.encode("utf-8").replace("\\", "/")
             
 
-        diffcmd = "git --git-dir=\"{0}\" --work-tree=\"{1}\" diff-tree --full-index -p \"{2}\"".format(gitDir, workTree, id)
+        diffcmd = "git --git-dir=\"{0}\" --work-tree=\"{1}\" diff-tree --full-index -p \"{2}\"".format(gitDir, self.oldWorkingDirectory, id)
         patchcmd = diffcmd + " | git apply "
+        if self.isWindows:
+            patchcmd = patchcmd + " --whitespace=fix "
         tryPatchCmd = patchcmd + "--check -"
         applyPatchCmd = patchcmd + "--check --apply -"
+
         patch_succeeded = True
 
         if verbose:
@@ -3988,7 +3999,10 @@ class P4Rebase(Command):
 
         print("Rebasing the current branch onto %s" % upstream)
         oldHead = read_pipe("git rev-parse HEAD").strip()
-        system("git rebase %s" % upstream)
+        if (platform.system() == "Windows"):
+            system("git rebase %s --whitespace=fix" % upstream)
+        else:
+            system("git rebase %s" % upstream)
         system("git diff-tree --stat --summary -M %s HEAD --" % oldHead)
         return True
 
@@ -4217,6 +4231,128 @@ class P4Branches(Command):
             print("%s <= %s (%s)" % (branch, ",".join(settings["depot-paths"]), settings["change"]))
         return True
 
+class P4Remove(Command):
+    def __init__(self):
+        Command.__init__(self)
+        self.options = [
+                optparse.make_option("--delete-files", 
+                                     dest="deleteFiles", 
+                                     action="store_true",
+                                     help="Removes any additional files found in the path"
+                                     ),
+                optparse.make_option("--origin", dest="origin"),
+                optparse.make_option("--revert", dest="revert", action="store_true", help="revert open files"),
+                optparse.make_option("--force", dest="force", action="store_true", help="Clobbers writable files that are not checked out"),
+                ]
+        self.deleteFiles = False
+        self.origin = ""
+        self.revert = False
+        self.force = False
+        self.description = ("Removes all the files from the P4 workspace (P4CLIENT)"
+                            + " and optionally removes any extra files left in that"
+                            + " directory. Try this if submit fails.")
+
+    def run(self, args):
+        # Copied from the Submit code to resolve the client spec and the local directory
+        if len(args) == 0:
+            self.master = currentGitBranch()
+        elif len(args) == 1:
+            self.master = args[0]
+            if not branchExists(self.master):
+                die("Branch %s does not exist" % self.master)
+        else:
+            return False
+
+        [upstream, settings] = findUpstreamBranchPoint()
+        self.depotPath = settings['depot-paths'][0]
+        if len(self.origin) == 0:
+            self.origin = upstream
+
+        if self.verbose:
+            print("Origin branch is " + self.origin)
+
+        if len(self.depotPath) == 0:
+            print("Internal error: cannot locate perforce depot path from existing branches")
+            sys.exit(128)
+
+        self.useClientSpec = False
+        if gitConfigBool("git-p4.useclientspec"):
+            self.useClientSpec = True
+        if self.useClientSpec:
+            self.clientSpecDirs = getClientSpec()
+
+        # Check for the existence of P4 branches
+        branchesDetected = (len(p4BranchesInGit().keys()) > 1)
+
+        if self.useClientSpec and not branchesDetected:
+            # all files are relative to the client spec
+            self.clientPath = getClientRoot()
+        else:
+            self.clientPath = p4Where(self.depotPath)
+
+        if self.clientPath == "":
+            die("Error: Cannot locate perforce checkout of %s in client view" % self.depotPath)
+
+        print("Perforce depot path %s located at %s" % (self.depotPath, self.clientPath))
+        self.oldWorkingDirectory = os.getcwd()
+
+        # check for opened files
+        results = p4CmdList(["opened", "-m", "1", self.depotPath + "..."])
+
+        if len(results) == 0:
+            # should never get here: always get either some results, or a p4ExitCode
+            assert("could not parse response from perforce")
+        
+        
+        if results != []:
+            result = results[0]
+            # Make sure we didn't get an error
+            if 'p4ExitCode' in result:
+                # p4 returned non-zero status, e.g. P4PORT invalid, or p4 not in path
+                die_bad_access("could not run p4")
+            if self.revert:
+                print("Reverting open files...")
+                try:
+                    p4_revert(self.depotPath + "...", "-w")
+                    print("Revert completed.")
+                except CalledProcessError as e:
+                    print("Revert failed with message: " + e.message)
+                    sys.exit(3)
+            else:
+                print("There are open files. Either submit the changeslists or --revert them")
+                sys.exit(2)
+
+        # There are no files checked out, sync to zero to remove from the local disk.
+        print("preparing to remove files from target")
+        try:
+            opts = ""
+            if self.force:
+                opts = "-f"
+            p4_remove(self.depotPath + "...", opts)
+        except CalledProcessError as e:
+                print("Remove from workspace failed. If files cannot be clobbered, try --force to remove writable and modified files")
+                sys.exit(2)
+
+        # Check to see if we are deleting files that in the working space or not.
+        success = True
+        if self.deleteFiles:
+            print("Removing non-source controlled files")
+            for the_file in os.listdir(self.clientPath):
+                file_path = os.path.join(self.clientPath, the_file)
+                try:
+                    if os.path.isfile(file_path):
+                        os.unlink(file_path)
+                    elif os.path.isdir(file_path): shutil.rmtree(file_path)
+                    print("  Removed: " + file_path.decode())
+                except OSError as e:
+                    print("  [Error {0}]: {1}: {2}".format(e.errno, e.strerror, e.filename.decode()))
+                    success = False
+            if not success:
+                print("Some files could not be removed. This will require manual intervention.")
+                sys.exit(3)
+        return True
+
+
 class P4Info(Command):
     def __init__(self):
         Command.__init__(self)
@@ -4282,6 +4418,7 @@ commands = {
     "branches" : P4Branches,
     "unshelve" : P4Unshelve,
     "info" : P4Info,
+    "remove": P4Remove,
 }
 
 
@@ -4305,7 +4442,7 @@ def main():
 
     args = sys.argv[2:]
 
-    options.append(optparse.make_option("--verbose", "-v", dest="verbose", action="store_true"))
+    options.append(optparse.make_option("--verbose", "-v", dest="verbose", action="store_true", help="Show intermediate command output and diagnostic text"))
     if cmd.needsGit:
         options.append(optparse.make_option("--git-dir", dest="gitdir"))
 
